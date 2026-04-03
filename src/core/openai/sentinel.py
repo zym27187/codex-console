@@ -151,8 +151,6 @@ def run_node_vm(action: str, payload: dict[str, Any], *, timeout: int = 40) -> d
     )
     if process.returncode != 0:
         stderr = (process.stderr or "").strip()
-        if "Cannot find module 'happy-dom'" in stderr:
-            raise SentinelTokenError("missing happy-dom; run `npm install` in the project root")
         raise SentinelTokenError(stderr or process.stdout.strip() or f"node exit={process.returncode}")
     if not process.stdout.strip():
         raise SentinelTokenError("node vm returned empty stdout")
