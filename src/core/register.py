@@ -1298,6 +1298,96 @@ class RegistrationEngine:
         )
         return callback_url, current_url
 
+    @staticmethod
+    def _is_registration_gate_url(url: str) -> bool:
+        text = str(url or "").strip().lower()
+        if not text:
+            return False
+        return ("auth.openai.com/about-you" in text) or ("auth.openai.com/add-phone" in text)
+
+    def _ensure_refresh_token(self, result: RegistrationResult, workspace_id: Optional[str] = None) -> bool:
+        """尽量补齐 refresh_token；补不到则返回 False。"""
+        if str(result.refresh_token or "").strip():
+            return True
+
+        cached_refresh = str(self._create_account_refresh_token or "").strip()
+        if cached_refresh:
+            result.refresh_token = cached_refresh
+            self._log("已从 create_account 缓存补到 refresh_token")
+            return True
+
+        resolved_workspace_id = str(
+            workspace_id
+            or result.workspace_id
+            or self._last_validate_otp_workspace_id
+            or self._create_account_workspace_id
+            or ""
+        ).strip()
+        if not resolved_workspace_id:
+            try:
+                resolved_workspace_id = str(self._get_workspace_id() or "").strip()
+            except Exception:
+                resolved_workspace_id = ""
+        if resolved_workspace_id and not result.workspace_id:
+            result.workspace_id = resolved_workspace_id
+
+        candidates: list[tuple[str, str]] = []
+        if resolved_workspace_id:
+            try:
+                select_continue = str(self._select_workspace(resolved_workspace_id) or "").strip()
+            except Exception as exc:
+                self._log(f"补抓 refresh_token 时 workspace/select 异常: {exc}", "warning")
+                select_continue = ""
+            if select_continue:
+                candidates.append(("workspace/select", select_continue))
+        for label, candidate in (
+            ("otp_continue", self._last_validate_otp_continue_url),
+            ("create_account_continue", self._create_account_continue_url),
+            ("oauth_authorize", getattr(self.oauth_start, "auth_url", "")),
+        ):
+            text = str(candidate or "").strip()
+            if text:
+                candidates.append((label, text))
+
+        seen: set[str] = set()
+        for label, candidate_url in candidates:
+            if candidate_url in seen:
+                continue
+            seen.add(candidate_url)
+            if self._is_registration_gate_url(candidate_url):
+                self._log(f"补抓 refresh_token 跳过注册门页候选: {label}", "warning")
+                continue
+
+            self._log(f"尝试补抓 refresh_token：{label}")
+            callback_url, final_url = self._follow_redirects(candidate_url)
+            if not callback_url:
+                self._log(
+                    f"补抓 refresh_token 未命中 callback: {label}, final={str(final_url or '')[:100]}...",
+                    "warning",
+                )
+                continue
+            callback_has_error = bool(
+                callback_url and ("error=" in callback_url) and ("code=" not in callback_url)
+            )
+            if callback_has_error:
+                self._log(f"补抓 refresh_token 命中错误 callback，跳过: {callback_url[:140]}...", "warning")
+                continue
+
+            token_info = self._handle_oauth_callback(callback_url)
+            if not token_info:
+                continue
+
+            result.account_id = str(token_info.get("account_id") or result.account_id or "").strip()
+            result.access_token = str(token_info.get("access_token") or result.access_token or "").strip()
+            result.refresh_token = str(token_info.get("refresh_token") or result.refresh_token or "").strip()
+            result.id_token = str(token_info.get("id_token") or result.id_token or "").strip()
+            if result.refresh_token:
+                self._log(f"补抓 refresh_token 成功：{label}")
+                return True
+
+        self._log("当前链路仍未获取到 refresh_token", "warning")
+        return False
+
     def _complete_token_exchange(self, result: RegistrationResult, require_login_otp: bool = True) -> bool:
         """在登录态已建立后，补齐 session/access，并尽量获取 OAuth token。"""
         if require_login_otp:
@@ -1439,12 +1529,6 @@ class RegistrationEngine:
         原生入口对齐备份版收尾链路：
         登录验证码 -> Workspace -> redirect -> OAuth callback -> token 入袋。
         """
-        def _is_registration_gate_url(url: str) -> bool:
-            u = str(url or "").strip().lower()
-            if not u:
-                return False
-            return ("auth.openai.com/about-you" in u) or ("auth.openai.com/add-phone" in u)
-
         self._log("等待登录验证码到场，最后这位嘉宾还在路上...")
         self._log("核对登录验证码，验明正身一下...")
         login_otp_tried_codes: set[str] = set()
@@ -1494,12 +1578,12 @@ class RegistrationEngine:
 
         continue_url = ""
         otp_continue = str(self._last_validate_otp_continue_url or "").strip()
-        if otp_continue and _is_registration_gate_url(otp_continue):
+        if otp_continue and self._is_registration_gate_url(otp_continue):
             self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
             otp_continue = ""
 
         cached_continue = str(self._create_account_continue_url or "").strip()
-        if cached_continue and _is_registration_gate_url(cached_continue):
+        if cached_continue and self._is_registration_gate_url(cached_continue):
             self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
             cached_continue = ""
 
@@ -2879,6 +2963,12 @@ class RegistrationEngine:
                 if not self._complete_token_exchange(result, require_login_otp=not use_abcard_entry):
                     return result
 
+            self._raise_if_cancelled("任务已取消，停止注册流程")
+            if not self._ensure_refresh_token(result, workspace_id=result.workspace_id):
+                result.error_message = "未获取到 refresh_token"
+                self._log("注册收尾缺少 refresh_token，本轮主链路判定失败，交由后续兜底处理", "warning")
+                return result
+
             # 10. 完成
             self._log("=" * 60)
             if self._is_existing_account:
@@ -2985,6 +3075,9 @@ class RegistrationEngine:
             }
         )
         result.metadata = metadata
+        if (not result.refresh_token) and (not bool(metadata.get("phone_verification_required"))):
+            result.success = False
+            result.error_message = "回退注册链路未获取到 refresh_token"
         return result
 
     def _run_anyauto_fallback(self, primary_error: str = "") -> RegistrationResult:

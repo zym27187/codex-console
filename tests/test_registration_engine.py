@@ -4,7 +4,7 @@ import json
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+from src.core.register import RegistrationEngine, RegistrationResult
 from src.services.base import BaseEmailService
 
 
@@ -269,6 +269,66 @@ def test_register_password_uses_signup_sentinel_header():
     assert json.loads(headers["openai-sentinel-token"])["flow"] == "username_password_create"
     assert headers["oai-device-id"] == "did-3"
     assert fake_client.sentinel_calls[0] == {"did": "did-3", "flow": "username_password_create"}
+
+
+def test_ensure_refresh_token_uses_create_account_cache():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine._create_account_refresh_token = "refresh-from-cache"
+    result = RegistrationResult(success=False, logs=[])
+
+    assert engine._ensure_refresh_token(result) is True
+    assert result.refresh_token == "refresh-from-cache"
+
+
+def test_ensure_refresh_token_recovers_via_oauth_authorize(monkeypatch):
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.oauth_start = OAuthStart(
+        auth_url="https://auth.example.test/oauth-start",
+        state="state-1",
+        code_verifier="verifier-1",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+    result = RegistrationResult(success=False, logs=[])
+
+    monkeypatch.setattr(
+        engine,
+        "_follow_redirects",
+        lambda url: ("http://localhost:1455/auth/callback?code=code-1&state=state-1", "https://chatgpt.com/"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_handle_oauth_callback",
+        lambda callback_url: {
+            "account_id": "acct-1",
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "id_token": "id-1",
+        },
+    )
+
+    assert engine._ensure_refresh_token(result) is True
+    assert result.account_id == "acct-1"
+    assert result.access_token == "access-1"
+    assert result.refresh_token == "refresh-1"
+    assert result.id_token == "id-1"
+
+
+def test_anyauto_fallback_without_refresh_token_is_failure():
+    engine = RegistrationEngine(FakeEmailService([]))
+
+    result = engine._build_anyauto_fallback_result(
+        {
+            "success": True,
+            "access_token": "access-1",
+            "session_token": "session-1",
+            "account_id": "acct-1",
+            "workspace_id": "ws-1",
+        },
+        primary_error="primary failed",
+    )
+
+    assert result.success is False
+    assert result.error_message == "回退注册链路未获取到 refresh_token"
 
 
 def test_run_registers_then_relogs_to_fetch_token():
