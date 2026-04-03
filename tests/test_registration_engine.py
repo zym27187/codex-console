@@ -271,6 +271,63 @@ def test_register_password_uses_signup_sentinel_header():
     assert fake_client.sentinel_calls[0] == {"did": "did-3", "flow": "username_password_create"}
 
 
+def test_register_password_uses_browser_fallback_on_http_400(monkeypatch):
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["register"], DummyResponse(status_code=400, text="Failed to create account. Please try again.")),
+    ])
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = session
+    engine.email = "tester@example.com"
+    fake_client = FakeOpenAIClient([session], [])
+    engine.http_client = fake_client
+    monkeypatch.setattr(
+        engine,
+        "_browser_submit_registration_request",
+        lambda **kwargs: {"success": True, "json": {}, "current_url": "https://auth.openai.com/create-account/password"},
+    )
+
+    success, password = engine._register_password(did="did-3")
+
+    assert success is True
+    assert password
+
+
+def test_create_user_account_uses_browser_fallback_on_http_400(monkeypatch):
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["create_account"], DummyResponse(status_code=400, text="Failed to create account. Please try again.")),
+    ])
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = session
+    engine.device_id = "did-4"
+    monkeypatch.setattr(
+        "src.core.register.generate_random_user_info",
+        lambda: {"name": "Test User", "birthdate": "2000-01-02"},
+    )
+    monkeypatch.setattr(engine, "_check_sentinel", lambda did, flow="authorize_continue": _sentinel_header(flow, did))
+    monkeypatch.setattr(
+        engine,
+        "_browser_submit_registration_request",
+        lambda **kwargs: {
+            "success": True,
+            "json": {
+                "continue_url": "https://auth.example.test/continue",
+                "account_id": "acct-browser",
+                "workspace_id": "ws-browser",
+                "refresh_token": "refresh-browser",
+            },
+            "current_url": "https://auth.openai.com/about-you",
+        },
+    )
+
+    success = engine._create_user_account()
+
+    assert success is True
+    assert engine._create_account_continue_url == "https://auth.example.test/continue"
+    assert engine._create_account_account_id == "acct-browser"
+    assert engine._create_account_workspace_id == "ws-browser"
+    assert engine._create_account_refresh_token == "refresh-browser"
+
+
 def test_ensure_refresh_token_uses_create_account_cache():
     engine = RegistrationEngine(FakeEmailService([]))
     engine._create_account_refresh_token = "refresh-from-cache"

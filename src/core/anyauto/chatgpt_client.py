@@ -27,6 +27,10 @@ from .utils import (
     random_delay,
     seed_oai_device_cookie,
 )
+from ..openai.browser_registration import (
+    DEFAULT_EXT_PASSKEY_CAPABILITIES,
+    submit_auth_request_with_playwright,
+)
 
 
 # Chrome 指纹配置
@@ -121,6 +125,28 @@ class ChatGPTClient:
         """在 headed 模式下加入轻微停顿，模拟有头浏览器节奏。"""
         if self.browser_mode == "headed":
             random_delay(low, high)
+
+    def _browser_submit_auth_request(self, url, payload, referer, flow="username_password_create"):
+        """在真实浏览器上下文中提交高风险注册请求。"""
+        result = submit_auth_request_with_playwright(
+            session=self.session,
+            url=url,
+            payload=payload,
+            device_id=self.device_id,
+            user_agent=self.ua,
+            accept_language=self.accept_language,
+            referer=referer,
+            flow=flow,
+            proxy=self.proxy,
+            browser_mode=self.browser_mode,
+            log_fn=self._log,
+        )
+        if result.get("success"):
+            self._log(f"Playwright 兜底提交成功: {url}")
+        else:
+            err = str(result.get("error") or result.get("text") or "").strip()
+            self._log(f"Playwright 兜底提交失败: {err or 'unknown error'}")
+        return result
 
     def _headers(
         self,
@@ -561,10 +587,10 @@ class ChatGPTClient:
             impersonate=self.impersonate,
             accept_language=self.accept_language,
         )
+        sentinel_error = ""
         if not sentinel_token:
             sentinel_error = get_last_sentinel_error() or "unknown sentinel error"
             self._log(f"register_user: 无法生成 sentinel token: {sentinel_error}")
-            return False, f"Sentinel token 获取失败: {sentinel_error}"
         
         headers = self._headers(
             url,
@@ -575,6 +601,7 @@ class ChatGPTClient:
             fetch_site="same-origin",
             extra_headers={
                 "oai-device-id": self.device_id,
+                "ext-passkey-client-capabilities": DEFAULT_EXT_PASSKEY_CAPABILITIES,
             },
         )
         headers["openai-sentinel-token"] = sentinel_token
@@ -585,6 +612,19 @@ class ChatGPTClient:
             "password": password,
         }
         
+        if not sentinel_token:
+            browser_result = self._browser_submit_auth_request(
+                url,
+                payload,
+                f"{self.AUTH}/create-account/password",
+                flow="username_password_create",
+            )
+            if browser_result.get("success"):
+                self._log("注册成功（Playwright 兜底）")
+                return True, "注册成功"
+            browser_error = str(browser_result.get("error") or browser_result.get("text") or "").strip()
+            return False, f"Sentinel token 获取失败: {sentinel_error}; Playwright fallback failed: {browser_error}"
+
         try:
             self._browser_pause()
             r = self.session.post(url, json=payload, headers=headers, timeout=30)
@@ -600,6 +640,18 @@ class ChatGPTClient:
                 except:
                     error_msg = r.text[:200]
                 self._log(f"注册失败: {r.status_code} - {error_msg}")
+                if r.status_code == 400:
+                    browser_result = self._browser_submit_auth_request(
+                        url,
+                        payload,
+                        f"{self.AUTH}/create-account/password",
+                        flow="username_password_create",
+                    )
+                    if browser_result.get("success"):
+                        self._log("注册成功（Playwright 兜底）")
+                        return True, "注册成功"
+                    browser_error = str(browser_result.get("error") or browser_result.get("text") or "").strip()
+                    return False, f"HTTP {r.status_code}: {error_msg}; Playwright fallback failed: {browser_error}"
                 return False, f"HTTP {r.status_code}: {error_msg}"
                 
         except Exception as e:
@@ -703,12 +755,12 @@ class ChatGPTClient:
             impersonate=self.impersonate,
             accept_language=self.accept_language,
         )
+        sentinel_error = ""
         if sentinel_token:
             self._log("create_account: 已生成 sentinel token")
         else:
             sentinel_error = get_last_sentinel_error() or "unknown sentinel error"
             self._log(f"create_account: 无法生成 sentinel token: {sentinel_error}")
-            return False, f"Sentinel token 获取失败: {sentinel_error}"
         
         headers = self._headers(
             url,
@@ -719,6 +771,7 @@ class ChatGPTClient:
             fetch_site="same-origin",
             extra_headers={
                 "oai-device-id": self.device_id,
+                "ext-passkey-client-capabilities": DEFAULT_EXT_PASSKEY_CAPABILITIES,
             },
         )
         headers["openai-sentinel-token"] = sentinel_token
@@ -729,6 +782,21 @@ class ChatGPTClient:
             "birthdate": birthdate,
         }
         
+        if not sentinel_token:
+            browser_result = self._browser_submit_auth_request(
+                url,
+                payload,
+                f"{self.AUTH}/about-you",
+                flow="username_password_create",
+            )
+            if browser_result.get("success"):
+                data = browser_result.get("json") or {}
+                next_state = self._state_from_payload(data, current_url=str(browser_result.get("current_url") or self.BASE))
+                self._log(f"账号创建成功（Playwright 兜底） {describe_flow_state(next_state)}")
+                return (True, next_state) if return_state else (True, "账号创建成功")
+            browser_error = str(browser_result.get("error") or browser_result.get("text") or "").strip()
+            return False, f"Sentinel token 获取失败: {sentinel_error}; Playwright fallback failed: {browser_error}"
+
         try:
             self._browser_pause()
             r = self.session.post(url, json=payload, headers=headers, timeout=30)
@@ -744,6 +812,23 @@ class ChatGPTClient:
             else:
                 error_msg = r.text[:200]
                 self._log(f"创建失败: {r.status_code} - {error_msg}")
+                if r.status_code == 400:
+                    browser_result = self._browser_submit_auth_request(
+                        url,
+                        payload,
+                        f"{self.AUTH}/about-you",
+                        flow="username_password_create",
+                    )
+                    if browser_result.get("success"):
+                        data = browser_result.get("json") or {}
+                        next_state = self._state_from_payload(
+                            data,
+                            current_url=str(browser_result.get("current_url") or self.BASE),
+                        )
+                        self._log(f"账号创建成功（Playwright 兜底） {describe_flow_state(next_state)}")
+                        return (True, next_state) if return_state else (True, "账号创建成功")
+                    browser_error = str(browser_result.get("error") or browser_result.get("text") or "").strip()
+                    return False, f"HTTP {r.status_code}: {error_msg}; Playwright fallback failed: {browser_error}"
                 return False, f"HTTP {r.status_code}"
                 
         except Exception as e:

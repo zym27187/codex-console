@@ -18,6 +18,10 @@ from datetime import datetime
 from curl_cffi import requests as cffi_requests
 
 from .anyauto.register_flow import AnyAutoRegistrationEngine
+from .openai.browser_registration import (
+    DEFAULT_EXT_PASSKEY_CAPABILITIES,
+    submit_auth_request_with_playwright,
+)
 from .openai.oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
@@ -190,6 +194,71 @@ class RegistrationEngine:
                     self.session.headers.update(default_headers)
         except Exception:
             pass
+
+    def _browser_submit_registration_request(
+        self,
+        *,
+        url: str,
+        payload: Dict[str, Any],
+        referer: str,
+        flow: str = "username_password_create",
+    ) -> Dict[str, Any]:
+        """在真实浏览器中补发高风险注册请求。"""
+        settings = get_settings()
+        browser_mode = str(getattr(settings, "registration_anyauto_browser_mode", "protocol") or "protocol").strip()
+        session_headers = getattr(self.session, "headers", {}) or {}
+        result = submit_auth_request_with_playwright(
+            session=self.session,
+            url=url,
+            payload=payload,
+            device_id=self._resolve_active_device_id(),
+            user_agent=session_headers.get("User-Agent") or self.http_client.default_headers.get("User-Agent", ""),
+            accept_language=session_headers.get("Accept-Language") or self.http_client.default_headers.get("Accept-Language"),
+            referer=referer,
+            flow=flow,
+            proxy=self.proxy_url,
+            browser_mode=browser_mode,
+            log_fn=self._log,
+        )
+        if result.get("success"):
+            self._log(f"Playwright 兜底提交成功: {url}")
+        else:
+            err = str(result.get("error") or result.get("text") or "").strip()
+            self._log(f"Playwright 兜底提交失败: {err or 'unknown error'}", "warning")
+        return result
+
+    def _cache_create_account_response(self, data: Dict[str, Any]) -> None:
+        """缓存 create_account 返回的重要字段，便于后续补链路。"""
+        if not isinstance(data, dict):
+            return
+        continue_url = str(data.get("continue_url") or "").strip()
+        if continue_url:
+            self._create_account_continue_url = continue_url
+            self._log(f"create_account 返回 continue_url，已缓存: {continue_url[:100]}...")
+        account_id = str(
+            data.get("account_id")
+            or data.get("chatgpt_account_id")
+            or (data.get("account") or {}).get("id")
+            or ""
+        ).strip()
+        if account_id:
+            self._create_account_account_id = account_id
+            self._log(f"create_account 返回 account_id，已缓存: {account_id}")
+        workspace_id = str(
+            data.get("workspace_id")
+            or data.get("default_workspace_id")
+            or (data.get("workspace") or {}).get("id")
+            or ""
+        ).strip()
+        if (not workspace_id) and isinstance(data.get("workspaces"), list) and data.get("workspaces"):
+            workspace_id = str((data.get("workspaces")[0] or {}).get("id") or "").strip()
+        if workspace_id:
+            self._create_account_workspace_id = workspace_id
+            self._log(f"create_account 返回 workspace_id，已缓存: {workspace_id}")
+        refresh_token = str(data.get("refresh_token") or "").strip()
+        if refresh_token:
+            self._create_account_refresh_token = refresh_token
+            self._log("create_account 返回 refresh_token，已缓存")
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -2159,7 +2228,19 @@ class RegistrationEngine:
             if current_sen_flow != "username_password_create":
                 current_sen_token = self._check_sentinel(current_did, flow="username_password_create") or ""
             if not current_sen_token:
-                self._last_register_password_error = "Sentinel token 获取失败 (username_password_create)"
+                browser_result = self._browser_submit_registration_request(
+                    url=OPENAI_API_ENDPOINTS["register"],
+                    payload={"password": password, "username": self.email},
+                    referer="https://auth.openai.com/create-account/password",
+                    flow="username_password_create",
+                )
+                if browser_result.get("success"):
+                    return True, password
+                browser_error = str(browser_result.get("error") or browser_result.get("text") or "").strip()
+                self._last_register_password_error = (
+                    f"Sentinel token 获取失败 (username_password_create); "
+                    f"Playwright fallback failed: {browser_error or 'unknown error'}"
+                )
                 return False, None
 
             # 提交密码注册
@@ -2175,6 +2256,7 @@ class RegistrationEngine:
                     "accept": "application/json",
                     "content-type": "application/json",
                     "oai-device-id": current_did,
+                    "ext-passkey-client-capabilities": DEFAULT_EXT_PASSKEY_CAPABILITIES,
                     "openai-sentinel-token": current_sen_token,
                 },
                 data=register_body,
@@ -2185,6 +2267,16 @@ class RegistrationEngine:
             if response.status_code != 200:
                 error_text = response.text[:500]
                 self._log(f"密码注册失败: {error_text}", "warning")
+                if response.status_code == 400:
+                    browser_result = self._browser_submit_registration_request(
+                        url=OPENAI_API_ENDPOINTS["register"],
+                        payload={"password": password, "username": self.email},
+                        referer="https://auth.openai.com/create-account/password",
+                        flow="username_password_create",
+                    )
+                    if browser_result.get("success"):
+                        self._log("密码注册成功（Playwright 兜底）")
+                        return True, password
 
                 # 解析错误信息，判断是否是邮箱已注册
                 try:
@@ -2511,11 +2603,26 @@ class RegistrationEngine:
             did = self._resolve_active_device_id()
             sentinel_token = self._check_sentinel(did, flow="username_password_create")
             if not sentinel_token:
-                self._log("账户创建前未能生成 Sentinel token", "warning")
-                return False
+                self._log("账户创建前未能生成 Sentinel token，尝试 Playwright 兜底...", "warning")
             user_info = generate_random_user_info()
             self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
             create_account_body = json.dumps(user_info)
+
+            if not sentinel_token:
+                browser_result = self._browser_submit_registration_request(
+                    url=OPENAI_API_ENDPOINTS["create_account"],
+                    payload=user_info,
+                    referer="https://auth.openai.com/about-you",
+                    flow="username_password_create",
+                )
+                if not browser_result.get("success"):
+                    return False
+                try:
+                    self._cache_create_account_response(browser_result.get("json") or {})
+                except Exception:
+                    pass
+                self._log("账户创建成功（Playwright 兜底）")
+                return True
 
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["create_account"],
@@ -2524,6 +2631,7 @@ class RegistrationEngine:
                     "accept": "application/json",
                     "content-type": "application/json",
                     "oai-device-id": did,
+                    "ext-passkey-client-capabilities": DEFAULT_EXT_PASSKEY_CAPABILITIES,
                     "openai-sentinel-token": sentinel_token,
                 },
                 data=create_account_body,
@@ -2533,38 +2641,25 @@ class RegistrationEngine:
 
             if response.status_code != 200:
                 self._log(f"账户创建失败: {response.text[:200]}", "warning")
+                if response.status_code == 400:
+                    browser_result = self._browser_submit_registration_request(
+                        url=OPENAI_API_ENDPOINTS["create_account"],
+                        payload=user_info,
+                        referer="https://auth.openai.com/about-you",
+                        flow="username_password_create",
+                    )
+                    if browser_result.get("success"):
+                        try:
+                            self._cache_create_account_response(browser_result.get("json") or {})
+                        except Exception:
+                            pass
+                        self._log("账户创建成功（Playwright 兜底）")
+                        return True
                 return False
 
             try:
                 data = response.json() or {}
-                continue_url = str(data.get("continue_url") or "").strip()
-                if continue_url:
-                    self._create_account_continue_url = continue_url
-                    self._log(f"create_account 返回 continue_url，已缓存: {continue_url[:100]}...")
-                account_id = str(
-                    data.get("account_id")
-                    or data.get("chatgpt_account_id")
-                    or (data.get("account") or {}).get("id")
-                    or ""
-                ).strip()
-                if account_id:
-                    self._create_account_account_id = account_id
-                    self._log(f"create_account 返回 account_id，已缓存: {account_id}")
-                workspace_id = str(
-                    data.get("workspace_id")
-                    or data.get("default_workspace_id")
-                    or (data.get("workspace") or {}).get("id")
-                    or ""
-                ).strip()
-                if (not workspace_id) and isinstance(data.get("workspaces"), list) and data.get("workspaces"):
-                    workspace_id = str((data.get("workspaces")[0] or {}).get("id") or "").strip()
-                if workspace_id:
-                    self._create_account_workspace_id = workspace_id
-                    self._log(f"create_account 返回 workspace_id，已缓存: {workspace_id}")
-                refresh_token = str(data.get("refresh_token") or "").strip()
-                if refresh_token:
-                    self._create_account_refresh_token = refresh_token
-                    self._log("create_account 返回 refresh_token，已缓存")
+                self._cache_create_account_response(data)
             except Exception:
                 pass
 
