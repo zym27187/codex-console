@@ -265,6 +265,7 @@ class OpenAIHTTPClient(HTTPClient):
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-site",
         }
+        self.last_sentinel_error: str = ""
 
     def check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """
@@ -362,22 +363,26 @@ class OpenAIHTTPClient(HTTPClient):
         Returns:
             openai-sentinel-token 值或 None
         """
+        self.last_sentinel_error = ""
         try:
+            session_headers = getattr(self.session, "headers", {}) or {}
             return build_openai_sentinel_token(
                 self.session,
                 did,
                 flow=flow,
-                user_agent=self.default_headers.get("User-Agent", ""),
-                sec_ch_ua=self.default_headers.get("sec-ch-ua"),
-                accept_language=self.default_headers.get("Accept-Language"),
+                user_agent=session_headers.get("User-Agent") or self.default_headers.get("User-Agent", ""),
+                sec_ch_ua=session_headers.get("sec-ch-ua") or self.default_headers.get("sec-ch-ua"),
+                accept_language=session_headers.get("Accept-Language") or self.default_headers.get("Accept-Language"),
                 proxies=proxies or self.proxies,
                 impersonate=self.config.impersonate,
                 timeout=self.config.timeout,
             )
         except SentinelPOWError as e:
+            self.last_sentinel_error = str(e or "").strip()
             logger.error(f"Sentinel token 生成失败: {e}")
             return None
         except Exception as e:
+            self.last_sentinel_error = str(e or "").strip()
             logger.error(f"Sentinel 检查异常: {e}")
             return None
 

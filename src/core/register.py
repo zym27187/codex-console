@@ -181,6 +181,16 @@ class RegistrationEngine:
             time.sleep(chunk)
             remaining -= chunk
 
+    def _sync_session_headers(self) -> None:
+        """让直接发出的注册请求与 Sentinel 生成使用同一组浏览器头。"""
+        try:
+            if self.session and hasattr(self.session, "headers"):
+                default_headers = getattr(self.http_client, "default_headers", None) or {}
+                if default_headers:
+                    self.session.headers.update(default_headers)
+        except Exception:
+            pass
+
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -439,6 +449,7 @@ class RegistrationEngine:
         self._raise_if_cancelled("任务已取消，跳过会话初始化")
         try:
             self.session = self.http_client.session
+            self._sync_session_headers()
             return True
         except Exception as e:
             self._log(f"初始化会话失败: {e}", "error")
@@ -456,6 +467,7 @@ class RegistrationEngine:
             try:
                 if not self.session:
                     self.session = self.http_client.session
+                    self._sync_session_headers()
 
                 response = self.session.get(
                     self.oauth_start.auth_url,
@@ -495,6 +507,7 @@ class RegistrationEngine:
                 self._sleep_interruptible(attempt)
                 self.http_client.close()
                 self.session = self.http_client.session
+                self._sync_session_headers()
 
         # 对齐 ABCard：无法从响应拿到 did 时，优先复用上次成功 did，再使用 UUID 兜底。
         fallback_did = str(self.device_id or "").strip() or str(uuid.uuid4())
@@ -531,7 +544,9 @@ class RegistrationEngine:
                     self.device_id = current_did
                 self._log(f"Sentinel token 获取成功 (flow={flow})")
                 return sen_token
-            self._log(f"Sentinel 检查失败: 未获取到 token (flow={flow})", "warning")
+            sentinel_detail = str(getattr(self.http_client, "last_sentinel_error", "") or "").strip()
+            detail_suffix = f": {sentinel_detail}" if sentinel_detail else ""
+            self._log(f"Sentinel 检查失败: 未获取到 token (flow={flow}){detail_suffix}", "warning")
             return None
 
         except Exception as e:
@@ -2898,7 +2913,12 @@ class RegistrationEngine:
                 return result
             result.device_id = did
             if not sen_token:
-                result.error_message = "Sentinel POW 验证失败"
+                sentinel_detail = str(getattr(self.http_client, "last_sentinel_error", "") or "").strip()
+                result.error_message = (
+                    f"Sentinel 验证失败: {sentinel_detail}"
+                    if sentinel_detail
+                    else "Sentinel POW 验证失败"
+                )
                 return result
 
             # 4. 提交注册入口邮箱

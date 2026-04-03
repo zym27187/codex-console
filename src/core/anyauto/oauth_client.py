@@ -22,7 +22,7 @@ from .utils import (
     random_delay,
     seed_oai_device_cookie,
 )
-from .sentinel_token import build_sentinel_token
+from .sentinel_token import build_sentinel_token, get_last_sentinel_error
 
 
 class OAuthClient:
@@ -439,9 +439,11 @@ class OAuthClient:
             user_agent=user_agent,
             sec_ch_ua=sec_ch_ua,
             impersonate=impersonate,
+            accept_language=self.session.headers.get("Accept-Language"),
         )
         if not sentinel_token:
-            self._set_error("无法获取 sentinel token (authorize_continue)")
+            sentinel_error = get_last_sentinel_error() or "unknown sentinel error"
+            self._set_error(f"无法获取 sentinel token (authorize_continue): {sentinel_error}")
             return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/authorize/continue"
@@ -521,9 +523,11 @@ class OAuthClient:
             user_agent=user_agent,
             sec_ch_ua=sec_ch_ua,
             impersonate=impersonate,
+            accept_language=self.session.headers.get("Accept-Language"),
         )
         if not sentinel_pwd:
-            self._set_error("无法获取 sentinel token (password_verify)")
+            sentinel_error = get_last_sentinel_error() or "unknown sentinel error"
+            self._set_error(f"无法获取 sentinel token (password_verify): {sentinel_error}")
             return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/password/verify"

@@ -15,7 +15,7 @@ except ImportError:
     import sys
     sys.exit(1)
 
-from .sentinel_token import build_sentinel_token
+from .sentinel_token import build_sentinel_token, get_last_sentinel_error
 from .utils import (
     FlowState,
     build_browser_headers,
@@ -559,7 +559,12 @@ class ChatGPTClient:
             user_agent=self.ua,
             sec_ch_ua=self.sec_ch_ua,
             impersonate=self.impersonate,
+            accept_language=self.accept_language,
         )
+        if not sentinel_token:
+            sentinel_error = get_last_sentinel_error() or "unknown sentinel error"
+            self._log(f"register_user: 无法生成 sentinel token: {sentinel_error}")
+            return False, f"Sentinel token 获取失败: {sentinel_error}"
         
         headers = self._headers(
             url,
@@ -572,8 +577,7 @@ class ChatGPTClient:
                 "oai-device-id": self.device_id,
             },
         )
-        if sentinel_token:
-            headers["openai-sentinel-token"] = sentinel_token
+        headers["openai-sentinel-token"] = sentinel_token
         headers.update(generate_datadog_trace())
         
         payload = {
@@ -697,11 +701,14 @@ class ChatGPTClient:
             user_agent=self.ua,
             sec_ch_ua=self.sec_ch_ua,
             impersonate=self.impersonate,
+            accept_language=self.accept_language,
         )
         if sentinel_token:
             self._log("create_account: 已生成 sentinel token")
         else:
-            self._log("create_account: 未生成 sentinel token，降级继续请求")
+            sentinel_error = get_last_sentinel_error() or "unknown sentinel error"
+            self._log(f"create_account: 无法生成 sentinel token: {sentinel_error}")
+            return False, f"Sentinel token 获取失败: {sentinel_error}"
         
         headers = self._headers(
             url,
@@ -714,8 +721,7 @@ class ChatGPTClient:
                 "oai-device-id": self.device_id,
             },
         )
-        if sentinel_token:
-            headers["openai-sentinel-token"] = sentinel_token
+        headers["openai-sentinel-token"] = sentinel_token
         headers.update(generate_datadog_trace())
         
         payload = {

@@ -291,30 +291,33 @@ class AnyAutoRegistrationEngine:
                 self._log("步骤 2/2: 优先复用注册会话提取 ChatGPT Session / AccessToken...")
                 session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
                 if session_ok:
-                    self._log("Token 提取完成！")
-                    account_id = str(session_result.get("account_id", "") or "").strip()
-                    if not account_id:
-                        account_id = str(session_result.get("workspace_id", "") or "").strip()
-                    if not account_id:
-                        account_id = self._extract_account_id_from_token(session_result.get("access_token", ""))
-                    workspace_id = str(session_result.get("workspace_id", "") or "").strip() or account_id
-                    return {
-                        "success": True,
-                        "access_token": session_result.get("access_token", ""),
-                        "session_token": session_result.get("session_token", ""),
-                        "account_id": account_id,
-                        "workspace_id": workspace_id,
-                        "metadata": {
-                            "auth_provider": session_result.get("auth_provider", ""),
-                            "expires": session_result.get("expires", ""),
-                            "user_id": session_result.get("user_id", ""),
-                            "user": session_result.get("user") or {},
-                            "account": session_result.get("account") or {},
-                        },
-                    }
+                    if session_result.get("refresh_token"):
+                        self._log("Token 提取完成！")
+                        account_id = str(session_result.get("account_id", "") or "").strip()
+                        if not account_id:
+                            account_id = str(session_result.get("workspace_id", "") or "").strip()
+                        if not account_id:
+                            account_id = self._extract_account_id_from_token(session_result.get("access_token", ""))
+                        workspace_id = str(session_result.get("workspace_id", "") or "").strip() or account_id
+                        return {
+                            "success": True,
+                            "access_token": session_result.get("access_token", ""),
+                            "refresh_token": session_result.get("refresh_token", ""),
+                            "session_token": session_result.get("session_token", ""),
+                            "account_id": account_id,
+                            "workspace_id": workspace_id,
+                            "metadata": {
+                                "auth_provider": session_result.get("auth_provider", ""),
+                                "expires": session_result.get("expires", ""),
+                                "user_id": session_result.get("user_id", ""),
+                                "user": session_result.get("user") or {},
+                                "account": session_result.get("account") or {},
+                            },
+                        }
+                    self._log("复用会话仅拿到 access/session，缺少 refresh_token，继续走 OAuth 补齐...")
 
                 # 6. OAuth 回退
-                self._log(f"复用会话失败，回退到 OAuth 登录补全流程: {session_result}")
+                self._log(f"复用会话未补齐 refresh_token，回退到 OAuth 登录补全流程: {session_result}")
                 tokens = None
                 oauth_client = None
                 for oauth_attempt in range(2):

@@ -10,6 +10,12 @@ from ..openai.sentinel import (
     fetch_sentinel_challenge as shared_fetch_sentinel_challenge,
 )
 
+_last_sentinel_error = ""
+
+
+def get_last_sentinel_error() -> str:
+    return str(_last_sentinel_error or "").strip()
+
 
 def build_sentinel_token(
     session,
@@ -18,18 +24,24 @@ def build_sentinel_token(
     user_agent=None,
     sec_ch_ua=None,
     impersonate=None,
+    accept_language: Optional[str] = None,
 ):
     """构建完整的 openai-sentinel-token JSON 字符串。"""
+    global _last_sentinel_error
     try:
-        return build_openai_sentinel_token(
+        token = build_openai_sentinel_token(
             session,
             device_id,
             flow=flow,
             user_agent=user_agent,
             sec_ch_ua=sec_ch_ua,
             impersonate=impersonate,
+            accept_language=accept_language,
         )
-    except Exception:
+        _last_sentinel_error = ""
+        return token
+    except Exception as exc:
+        _last_sentinel_error = str(exc or "").strip()
         return None
 
 
@@ -61,4 +73,5 @@ __all__ = [
     "build_sentinel_pow_token",
     "build_sentinel_token",
     "fetch_sentinel_challenge",
+    "get_last_sentinel_error",
 ]
