@@ -124,6 +124,7 @@ class FakeOpenAIClient:
         self._session_index = 0
         self._session = self._sessions[0]
         self._sentinel_tokens = list(sentinel_tokens)
+        self.sentinel_calls = []
 
     @property
     def session(self):
@@ -132,10 +133,14 @@ class FakeOpenAIClient:
     def check_ip_location(self):
         return True, "US"
 
-    def check_sentinel(self, did):
-        if not self._sentinel_tokens:
-            raise AssertionError("no sentinel token queued")
-        return self._sentinel_tokens.pop(0)
+    def check_sentinel(self, did, flow="authorize_continue"):
+        self.sentinel_calls.append({
+            "did": did,
+            "flow": flow,
+        })
+        if self._sentinel_tokens:
+            return self._sentinel_tokens.pop(0)
+        return _sentinel_header(flow, did)
 
     def close(self):
         if self._session_index + 1 < len(self._sessions):
@@ -166,25 +171,104 @@ def _response_with_login_cookies(workspace_id="ws-1", session_token="session-1")
     return DummyResponse(status_code=200, payload={}, on_return=setter)
 
 
-def test_check_sentinel_sends_non_empty_pow(monkeypatch):
-    session = QueueSession([
-        ("POST", OPENAI_API_ENDPOINTS["sentinel"], DummyResponse(payload={"token": "sentinel-token"})),
-    ])
-    client = OpenAIHTTPClient()
-    client._session = session
-
-    monkeypatch.setattr(
-        "src.core.http_client.build_sentinel_pow_token",
-        lambda user_agent: "gAAAAACpow-token",
+def _sentinel_header(flow, did):
+    return json.dumps(
+        {
+            "p": f"{flow}-p",
+            "t": f"{flow}-t",
+            "c": f"{flow}-c",
+            "id": did,
+            "flow": flow,
+        },
+        separators=(",", ":"),
     )
 
-    token = client.check_sentinel("device-1")
 
-    assert token == "sentinel-token"
-    body = json.loads(session.calls[0]["kwargs"]["data"])
-    assert body["id"] == "device-1"
-    assert body["flow"] == "authorize_continue"
-    assert body["p"] == "gAAAAACpow-token"
+def test_check_sentinel_builds_full_header(monkeypatch):
+    client = OpenAIHTTPClient()
+    fake_session = object()
+    client._session = fake_session
+    captured = {}
+
+    def fake_builder(session, did, **kwargs):
+        captured["session"] = session
+        captured["did"] = did
+        captured["kwargs"] = kwargs
+        return _sentinel_header(kwargs["flow"], did)
+
+    monkeypatch.setattr("src.core.http_client.build_openai_sentinel_token", fake_builder)
+
+    token = client.check_sentinel("device-1", flow="password_verify")
+
+    assert json.loads(token)["flow"] == "password_verify"
+    assert captured["session"] is fake_session
+    assert captured["did"] == "device-1"
+    assert captured["kwargs"]["flow"] == "password_verify"
+
+
+def test_submit_signup_form_uses_full_sentinel_header_without_rewrapping():
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["signup"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["PASSWORD_REGISTRATION"]}}),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = session
+    engine.email = "tester@example.com"
+
+    sentinel_token = _sentinel_header("authorize_continue", "did-1")
+    result = engine._submit_signup_form("did-1", sentinel_token)
+
+    assert result.success is True
+    headers = session.calls[0]["kwargs"]["headers"]
+    assert headers["openai-sentinel-token"] == sentinel_token
+    assert headers["oai-device-id"] == "did-1"
+
+
+def test_submit_login_password_uses_password_verify_sentinel_header():
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["password_verify"],
+            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
+        ),
+    ])
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = session
+    engine.password = "Passw0rd!"
+    engine.device_id = "did-2"
+    fake_client = FakeOpenAIClient([session], [])
+    engine.http_client = fake_client
+
+    result = engine._submit_login_password()
+
+    assert result.success is True
+    headers = session.calls[0]["kwargs"]["headers"]
+    assert json.loads(headers["openai-sentinel-token"])["flow"] == "password_verify"
+    assert headers["oai-device-id"] == "did-2"
+    assert fake_client.sentinel_calls[0] == {"did": "did-2", "flow": "password_verify"}
+
+
+def test_register_password_uses_signup_sentinel_header():
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["register"], DummyResponse(payload={})),
+    ])
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = session
+    engine.email = "tester@example.com"
+    fake_client = FakeOpenAIClient([session], [])
+    engine.http_client = fake_client
+
+    success, password = engine._register_password(did="did-3")
+
+    assert success is True
+    assert password
+    headers = session.calls[0]["kwargs"]["headers"]
+    assert json.loads(headers["openai-sentinel-token"])["flow"] == "username_password_create"
+    assert headers["oai-device-id"] == "did-3"
+    assert fake_client.sentinel_calls[0] == {"did": "did-3", "flow": "username_password_create"}
 
 
 def test_run_registers_then_relogs_to_fetch_token():

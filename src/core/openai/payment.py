@@ -16,6 +16,7 @@ from curl_cffi import requests as cffi_requests
 
 from ...database.models import Account
 from .overview import fetch_codex_overview, AccountDeactivatedError
+from .sentinel import build_openai_sentinel_token
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,6 @@ PAYMENT_CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
 ACCOUNT_CHECK_URL = "https://chatgpt.com/backend-api/wham/accounts/check"
 TEAM_CHECKOUT_BASE_URL = "https://chatgpt.com/checkout/openai_llc/"
 AIMIZY_PAY_URL = "https://team.aimizy.com/pay"
-SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 CHECKOUT_LINK_REGEX = re.compile(r"https://chatgpt\.com/checkout/openai_llc/cs_[A-Za-z0-9_-]+", re.IGNORECASE)
 CHECKOUT_SESSION_REGEX = re.compile(r"\bcs_[A-Za-z0-9_-]+\b", re.IGNORECASE)
 PUBLISHABLE_KEY_REGEX = re.compile(r"\bpk_(?:live|test)_[A-Za-z0-9]+\b", re.IGNORECASE)
@@ -652,45 +652,20 @@ def _build_openai_sentinel_token(
     if not device_id:
         return None
 
-    body = json.dumps({"p": "", "id": device_id, "flow": "authorize_continue"})
-    headers = {
-        "Origin": "https://sentinel.openai.com",
-        "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-        "Content-Type": "text/plain;charset=UTF-8",
-        "Accept": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-    }
-    if account.cookies:
-        headers["cookie"] = account.cookies
-
     try:
-        resp = cffi_requests.post(
-            SENTINEL_REQ_URL,
-            headers=headers,
-            data=body,
+        return build_openai_sentinel_token(
+            cffi_requests,
+            device_id,
+            flow="authorize_continue",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            accept_language="zh-CN,zh;q=0.9",
             proxies=_build_proxies(proxy),
-            timeout=20,
             impersonate="chrome110",
-        )
-        if resp.status_code != 200:
-            logger.debug(f"sentinel token 获取失败: HTTP {resp.status_code}")
-            return None
-        data = resp.json() if resp.content else {}
-        token = str(data.get("token") or "").strip()
-        if not token:
-            logger.debug("sentinel token 为空")
-            return None
-        return json.dumps(
-            {
-                "p": "",
-                "t": "",
-                "c": token,
-                "id": device_id,
-                "flow": "authorize_continue",
-            }
+            extra_headers={"cookie": account.cookies} if account.cookies else None,
+            timeout=20,
         )
     except Exception as exc:
         logger.debug(f"sentinel token 获取异常: {exc}")

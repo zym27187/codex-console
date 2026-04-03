@@ -33,6 +33,7 @@ uv.lock
 *.swp
 *.swo
 *~
+node_modules/
 
 # Data and Logs
 data/

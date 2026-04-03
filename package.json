@@ -1,0 +1,8 @@
+{
+  "name": "codex-console",
+  "private": true,
+  "description": "Node helpers used by the OpenAI Sentinel SDK bridge",
+  "dependencies": {
+    "happy-dom": "^15.11.7"
+  }
+}

@@ -506,19 +506,36 @@ class RegistrationEngine:
         self._log(f"未获取到 oai-did，使用兜底 Device ID: {fallback_did}", "warning")
         return fallback_did
 
-    def _check_sentinel(self, did: str) -> Optional[str]:
-        """检查 Sentinel 拦截"""
-        self._raise_if_cancelled("任务已取消，停止 Sentinel 检查")
+    def _resolve_active_device_id(self, fallback: Optional[str] = None) -> str:
+        """优先复用当前会话中的 Device ID。"""
+        current = str(fallback or self.device_id or "").strip()
+        if current:
+            return current
         try:
-            sen_token = self.http_client.check_sentinel(did)
+            if self.session:
+                cookie_did = str(self.session.cookies.get("oai-did") or "").strip()
+                if cookie_did:
+                    return cookie_did
+        except Exception:
+            pass
+        return str(uuid.uuid4())
+
+    def _check_sentinel(self, did: str, flow: str = "authorize_continue") -> Optional[str]:
+        """生成指定 flow 的 Sentinel 请求头值。"""
+        self._raise_if_cancelled("任务已取消，停止 Sentinel 检查")
+        current_did = self._resolve_active_device_id(did)
+        try:
+            sen_token = self.http_client.check_sentinel(current_did, flow=flow)
             if sen_token:
-                self._log(f"Sentinel token 获取成功")
+                if current_did and current_did != self.device_id:
+                    self.device_id = current_did
+                self._log(f"Sentinel token 获取成功 (flow={flow})")
                 return sen_token
-            self._log("Sentinel 检查失败: 未获取到 token", "warning")
+            self._log(f"Sentinel 检查失败: 未获取到 token (flow={flow})", "warning")
             return None
 
         except Exception as e:
-            self._log(f"Sentinel 检查异常: {e}", "warning")
+            self._log(f"Sentinel 检查异常 (flow={flow}): {e}", "warning")
             return None
 
     def _submit_auth_start(
@@ -555,17 +572,11 @@ class RegistrationEngine:
                     "referer": referer,
                     "accept": "application/json",
                     "content-type": "application/json",
+                    "oai-device-id": current_did,
                 }
 
                 if current_sen_token:
-                    sentinel = json.dumps({
-                        "p": "",
-                        "t": "",
-                        "c": current_sen_token,
-                        "id": current_did,
-                        "flow": "authorize_continue",
-                    })
-                    headers["openai-sentinel-token"] = sentinel
+                    headers["openai-sentinel-token"] = current_sen_token
 
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["signup"],
@@ -594,7 +605,7 @@ class RegistrationEngine:
                     )
                     # 尝试刷新 sentinel，避免 token 过期导致冲突。
                     try:
-                        refreshed = self._check_sentinel(current_did)
+                        refreshed = self._check_sentinel(current_did, flow="authorize_continue")
                         if refreshed:
                             current_sen_token = refreshed
                     except Exception:
@@ -687,6 +698,7 @@ class RegistrationEngine:
         """提交登录密码，进入邮箱验证码页面。"""
         self._raise_if_cancelled("任务已取消，停止提交登录密码")
         max_attempts = 3
+        did = self._resolve_active_device_id()
         password_text = str(self.password or "").strip()
         if not password_text and self.email:
             try:
@@ -709,12 +721,17 @@ class RegistrationEngine:
         for attempt in range(1, max_attempts + 1):
             self._raise_if_cancelled("任务已取消，停止登录密码重试")
             try:
+                sentinel_token = self._check_sentinel(did, flow="password_verify")
+                if not sentinel_token:
+                    return SignupFormResult(success=False, error_message="Sentinel token 获取失败 (password_verify)")
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["password_verify"],
                     headers={
                         "referer": "https://auth.openai.com/log-in/password",
                         "accept": "application/json",
                         "content-type": "application/json",
+                        "oai-device-id": did,
+                        "openai-sentinel-token": sentinel_token,
                     },
                     data=json.dumps({"password": self.password}),
                 )
@@ -2027,10 +2044,24 @@ class RegistrationEngine:
         """注册密码"""
         try:
             self._last_register_password_error = None
+            current_did = self._resolve_active_device_id(did)
             # 生成密码
             password = self._generate_password()
             self.password = password  # 保存密码到实例变量
             self._log(f"生成密码: {password}")
+
+            current_sen_token = str(sen_token or "").strip() if sen_token else ""
+            current_sen_flow = ""
+            if current_sen_token:
+                try:
+                    current_sen_flow = str((json.loads(current_sen_token) or {}).get("flow") or "").strip()
+                except Exception:
+                    current_sen_flow = ""
+            if current_sen_flow != "username_password_create":
+                current_sen_token = self._check_sentinel(current_did, flow="username_password_create") or ""
+            if not current_sen_token:
+                self._last_register_password_error = "Sentinel token 获取失败 (username_password_create)"
+                return False, None
 
             # 提交密码注册
             register_body = json.dumps({
@@ -2044,6 +2075,8 @@ class RegistrationEngine:
                     "referer": "https://auth.openai.com/create-account/password",
                     "accept": "application/json",
                     "content-type": "application/json",
+                    "oai-device-id": current_did,
+                    "openai-sentinel-token": current_sen_token,
                 },
                 data=register_body,
             )
@@ -2376,6 +2409,11 @@ class RegistrationEngine:
         """创建用户账户"""
         self._raise_if_cancelled("任务已取消，停止创建用户账户")
         try:
+            did = self._resolve_active_device_id()
+            sentinel_token = self._check_sentinel(did, flow="username_password_create")
+            if not sentinel_token:
+                self._log("账户创建前未能生成 Sentinel token", "warning")
+                return False
             user_info = generate_random_user_info()
             self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
             create_account_body = json.dumps(user_info)
@@ -2386,6 +2424,8 @@ class RegistrationEngine:
                     "referer": "https://auth.openai.com/about-you",
                     "accept": "application/json",
                     "content-type": "application/json",
+                    "oai-device-id": did,
+                    "openai-sentinel-token": sentinel_token,
                 },
                 data=create_account_body,
             )
